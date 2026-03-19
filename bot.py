@@ -5,9 +5,10 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-TOKEN = "TOKEN_HERE"
+from config import TOKEN
 
 bot = Bot(token=TOKEN)
+
 dp = Dispatcher()
 
 scheduler = AsyncIOScheduler()

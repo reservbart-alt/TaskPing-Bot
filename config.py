@@ -1,1 +1,3 @@
-TOKEN = "TOKEN_HERE"
+import os
+
+TOKEN = os.getenv("BOT_TOKEN")
