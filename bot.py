@@ -8,7 +8,6 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 
 from config import TOKEN
@@ -81,7 +80,7 @@ def get_user_timezone(user_id):
 def get_tz(user_id):
     return timezone(timedelta(hours=get_user_timezone(user_id)))
 
-# --- TZ PARSE ---
+# --- TZ PARSE + FALLBACK ---
 def parse_timezone(text: str):
     text = text.strip().upper().replace(" ", "")
     match = re.match(r"(UTC)?([+-]?\d{1,2})", text)
@@ -164,13 +163,14 @@ def menu(user_id):
         [KeyboardButton(text="➕ Создать событие")],
         [KeyboardButton(text="✏️ Редактировать событие")],
         [KeyboardButton(text="❌ Удалить событие")],
+        [KeyboardButton(text="✏️ Категории")],
         [KeyboardButton(text="🌍 Часовой пояс")]
     ]
     for c in get_categories(user_id):
         kb.append([KeyboardButton(text=c)])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# --- HANDLER ---
+# --- MAIN HANDLER ---
 @dp.message()
 async def msg(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -182,7 +182,7 @@ async def msg(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer("Меню", reply_markup=menu(user_id))
 
-    # --- TIMEZONE ---
+    # --- TZ ---
     elif text == "🌍 Часовой пояс":
         await state.set_state(TimezoneState.choosing)
         await message.answer(
@@ -193,17 +193,27 @@ async def msg(message: types.Message, state: FSMContext):
         offset = parse_timezone(text)
 
         if offset is None:
-            await message.answer(
-                "❌ Не понял\nНапиши например: UTC+3 или 3"
-            )
+            await message.answer("❌ Не понял\nНапиши: UTC+3 или 3")
             return
 
         set_user_timezone(user_id, offset)
         await state.clear()
-        await message.answer(
-            f"✅ Часовой пояс: UTC{offset:+}",
-            reply_markup=menu(user_id)
-        )
+        await message.answer(f"✅ UTC{offset:+}", reply_markup=menu(user_id))
+
+    # --- CATEGORY ---
+    elif text == "✏️ Категории":
+        await message.answer("Напиши название новой категории или выбери для удаления")
+
+    elif text.startswith("-"):
+        name = text[1:]
+        cursor.execute("DELETE FROM categories WHERE name=? AND user_id=?", (name, user_id))
+        conn.commit()
+        await message.answer("Удалено", reply_markup=menu(user_id))
+
+    elif text not in ["📅 Мои события","➕ Создать событие","✏️ Редактировать событие","❌ Удалить событие","🌍 Часовой пояс"] and await state.get_state() is None:
+        cursor.execute("INSERT INTO categories(user_id,name) VALUES(?,?)",(user_id,text))
+        conn.commit()
+        await message.answer("Категория добавлена", reply_markup=menu(user_id))
 
     # --- CREATE EVENT ---
     elif text in get_categories(user_id):
@@ -232,6 +242,71 @@ async def msg(message: types.Message, state: FSMContext):
 
         await message.answer(msg)
 
+    # --- DELETE EVENT ---
+    elif text == "❌ Удалить событие":
+        cursor.execute("SELECT id,category,date FROM events WHERE user_id=?", (user_id,))
+        rows = cursor.fetchall()
+
+        if not rows:
+            await message.answer("Нет событий")
+            return
+
+        await state.set_state(DeleteEventState.choosing)
+        await state.update_data(events=rows)
+
+        msg = ""
+        for i, r in enumerate(rows):
+            dt = datetime.strptime(r[2], "%Y-%m-%d %H:%M")
+            msg += f"{i+1}. {r[1]} {format_date(dt)}\n"
+
+        await message.answer(msg)
+
+    elif await state.get_state() == DeleteEventState.choosing:
+        data = await state.get_data()
+        try:
+            event = data["events"][int(text)-1]
+            cursor.execute("DELETE FROM events WHERE id=?", (event[0],))
+            conn.commit()
+            await state.clear()
+            await message.answer("Удалено", reply_markup=menu(user_id))
+        except:
+            await message.answer("Ошибка")
+
+    # --- EDIT ---
+    elif text == "✏️ Редактировать событие":
+        cursor.execute("SELECT id,category,date FROM events WHERE user_id=?", (user_id,))
+        rows = cursor.fetchall()
+
+        if not rows:
+            await message.answer("Нет событий")
+            return
+
+        await state.set_state(EditEvent.choosing_event)
+        await state.update_data(events=rows)
+
+        msg = ""
+        for i, r in enumerate(rows):
+            dt = datetime.strptime(r[2], "%Y-%m-%d %H:%M")
+            msg += f"{i+1}. {r[1]} {format_date(dt)}\n"
+
+        await message.answer(msg)
+
+    elif await state.get_state() == EditEvent.choosing_event:
+        data = await state.get_data()
+
+        try:
+            event = data["events"][int(text)-1]
+        except:
+            await message.answer("Ошибка")
+            return
+
+        await state.update_data(event_id=event[0])
+
+        cal = SimpleCalendar()
+        await message.answer("Новая дата:", reply_markup=await cal.start_calendar())
+
+        await state.set_state(EditEvent.choosing_date)
+
 # --- CALENDAR ---
 @dp.callback_query(SimpleCalendarCallback.filter())
 async def calendar(callback: types.CallbackQuery, callback_data: dict, state: FSMContext):
@@ -240,12 +315,12 @@ async def calendar(callback: types.CallbackQuery, callback_data: dict, state: FS
 
     if ok:
         await state.update_data(date=date)
-        await state.set_state(CreateEvent.choosing_time)
+        await state.set_state(EditEvent.choosing_time)
         await callback.message.answer("Время? (18:30)")
 
-# --- CREATE TIME ---
-@dp.message(CreateEvent.choosing_time)
-async def create_time(message: types.Message, state: FSMContext):
+# --- EDIT TIME ---
+@dp.message(EditEvent.choosing_time)
+async def edit_time(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     t = parse_time(message.text)
 
@@ -258,16 +333,12 @@ async def create_time(message: types.Message, state: FSMContext):
 
     dt = datetime(data["date"].year, data["date"].month, data["date"].day, t[0], t[1], tzinfo=tz)
 
-    cursor.execute(
-        "INSERT INTO events(user_id,category,date) VALUES(?,?,?)",
-        (user_id, data["category"], dt.strftime("%Y-%m-%d %H:%M"))
-    )
+    cursor.execute("UPDATE events SET date=? WHERE id=?",
+                   (dt.strftime("%Y-%m-%d %H:%M"), data["event_id"]))
     conn.commit()
 
-    schedule_event(message.chat.id, data["category"], dt)
-
     await state.clear()
-    await message.answer("Создано", reply_markup=menu(user_id))
+    await message.answer("Обновлено", reply_markup=menu(user_id))
 
 # --- START ---
 async def main():
